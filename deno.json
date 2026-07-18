@@ -1,0 +1,33 @@
+{
+  "tasks": {
+    "dev": "deno run --env-file=.env --allow-env --allow-net --allow-read --allow-write --watch main.ts",
+    "start": "deno run --env-file=.env --allow-env --allow-net --allow-read --allow-write main.ts",
+    "test": "deno test --allow-env --allow-read --allow-write",
+    "check": "deno fmt --check && deno lint && deno check main.ts scripts/telegram_webhook.ts && deno test --allow-env --allow-read --allow-write",
+    "fmt": "deno fmt",
+    "webhook": "deno run --env-file=.env --allow-env --allow-net=api.telegram.org scripts/telegram_webhook.ts set",
+    "webhook:info": "deno run --env-file=.env --allow-env --allow-net=api.telegram.org scripts/telegram_webhook.ts info",
+    "webhook:delete": "deno run --env-file=.env --allow-env --allow-net=api.telegram.org scripts/telegram_webhook.ts delete",
+    "deploy": "deno fmt deno.json && deno deploy --prod && deno fmt deno.json"
+  },
+  "unstable": ["kv"],
+  "fmt": {
+    "lineWidth": 92,
+    "semiColons": true,
+    "singleQuote": false
+  },
+  "lint": {
+    "rules": {
+      "tags": ["recommended"]
+    }
+  },
+  "deploy": {
+    "org": "sjoberg",
+    "app": "sigmabot",
+    "runtime": {
+      "type": "dynamic",
+      "entrypoint": "main.ts",
+      "memory_limit": 512
+    }
+  }
+}
