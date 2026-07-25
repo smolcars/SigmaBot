@@ -1,5 +1,6 @@
-import { type AIGateway, AIProviderError } from "./ai.ts";
+import { type AIGateway, type AIGenerationOptions, AIProviderError } from "./ai.ts";
 import type { AppConfig } from "./config.ts";
+import { GitHubApiError, type GitHubGateway, type GitHubIssue } from "./github.ts";
 import {
   buildUserName,
   constantTimeEqual,
@@ -22,6 +23,14 @@ import {
   truncateResponse,
 } from "./helpers.ts";
 import { Logger } from "./logger.ts";
+import {
+  buildIssueContext,
+  containsLikelySecret,
+  ISSUE_SYSTEM_PROMPT,
+  IssueDraftError,
+  parseIssueArguments,
+  parseIssueDraft,
+} from "./issues.ts";
 import { type AssistantHistoryPayload, BotStore } from "./store.ts";
 import { TelegramApiError, type TelegramGateway } from "./telegram.ts";
 import type {
@@ -54,6 +63,12 @@ const USER_MESSAGES = {
     "Image understanding isn't supported by the current AI provider and model.",
   imageDownloadFailed: "I couldn't download that image. Please try again or re-upload it.",
   aiError: "Sorry, I couldn't process that message. Please try again.",
+  issueNotConfigured: "GitHub issue creation isn't configured.",
+  issueNotAllowed: "You aren't allowed to create GitHub issues.",
+  issueContextInsufficient:
+    "I couldn't find enough context to create an issue. Add a description or discuss the issue first.",
+  issueDraftInvalid: "I couldn't prepare a safe GitHub issue from that context.",
+  issueCreateFailed: "I couldn't create the GitHub issue. Please try again later.",
 } as const;
 
 type ProcessResult =
@@ -65,11 +80,13 @@ type ProcessResult =
 export interface BotApplicationOptions {
   now?: () => number;
   randomUUID?: () => string;
+  github?: GitHubGateway;
 }
 
 export class BotApplication {
   readonly #now: () => number;
   readonly #randomUUID: () => string;
+  readonly #github?: GitHubGateway;
   readonly #log = new Logger("sigmabot");
 
   constructor(
@@ -81,6 +98,10 @@ export class BotApplication {
   ) {
     this.#now = options.now ?? Date.now;
     this.#randomUUID = options.randomUUID ?? (() => crypto.randomUUID());
+    this.#github = options.github;
+    if (this.config.github && !this.#github) {
+      throw new Error("GitHub is configured but no GitHub gateway was provided");
+    }
   }
 
   fetch = async (request: Request): Promise<Response> => {
@@ -268,7 +289,30 @@ export class BotApplication {
       const permanentTelegramError = error instanceof TelegramApiError &&
         error.status >= 400 && error.status < 500 &&
         !isRetryableTelegramStatus(error.status);
+      const deferredGitHubError = error instanceof GitHubApiError &&
+        error.retryable && error.retryAfterMs !== undefined;
       try {
+        if (deferredGitHubError) {
+          const now = this.#now();
+          const requestedRetry = now + Math.max(1_000, error.retryAfterMs!);
+          const retryNotBefore = Number.isSafeInteger(requestedRetry)
+            ? requestedRetry
+            : now + 1_000;
+          await this.store.deferJob(
+            updateId,
+            owner,
+            now,
+            retryNotBefore,
+            `github_${error.status ?? "retry"}`,
+          );
+          log.warn({
+            action: "github_deferred",
+            retryNotBefore,
+            ...safeErrorDetails(error),
+          });
+          return { status: "deferred", retryNotBefore };
+        }
+
         if (error instanceof TelegramApiError && error.status === 429) {
           const now = this.#now();
           const retryDelayMs = error.retryAfterMs ?? 1_000;
@@ -340,6 +384,11 @@ export class BotApplication {
     const directMessagesTopicId = message.direct_messages_topic?.topic_id;
     const user = message.from!;
     const userName = buildUserName(user);
+
+    if (job.issueSubmission) {
+      return await this.publishIssue(job, owner, message, log);
+    }
+
     const messageText = message.text ?? message.caption ?? "";
     const image = extractImage(message);
     const hasSupportedContent = Boolean(messageText || image);
@@ -432,6 +481,9 @@ export class BotApplication {
           log,
         );
         return "done";
+      }
+      if (command === "/issue") {
+        return await this.processIssueCommand(job, owner, message, messageText, epoch, log);
       }
       await this.store.storeMessage(userMessage, this.config.maxRetainedMessages);
       await this.store.finishJob(updateId, owner, "done", this.#now());
@@ -641,11 +693,10 @@ export class BotApplication {
         log,
       );
     }
-    const preparedDelivery = aiResponse.webCitations?.length
-      ? prepareTelegramResponse(responseText, aiResponse.webCitations)
-      : undefined;
-    const deliveryText = preparedDelivery?.plainText ??
-      prepareTelegramResponse(responseText).plainText;
+    const preparedDelivery = prepareTelegramResponse(
+      responseText,
+      aiResponse.webCitations ?? [],
+    );
     const webSearchCount = aiResponse.webSearchCount ??
       aiResponse.webSearchQueries?.length ?? 0;
     return await this.prepareAndDeliver(
@@ -657,11 +708,11 @@ export class BotApplication {
         messageThreadId,
         directMessagesTopicId,
         epoch,
-        text: deliveryText,
+        text: preparedDelivery.plainText,
         storeAssistant: true,
         inputTokens: aiResponse.inputTokens,
         outputTokens: aiResponse.outputTokens,
-        ...(preparedDelivery && { formatted: preparedDelivery.formatted }),
+        formatted: preparedDelivery.formatted,
         ...(webSearchCount > 0 && { webSearchCount }),
       },
       log,
@@ -671,6 +722,277 @@ export class BotApplication {
           reasoningContent: aiResponse.reasoningContent,
         }),
       },
+    );
+  }
+
+  private async processIssueCommand(
+    job: UpdateJob,
+    owner: string,
+    message: TelegramMessage,
+    messageText: string,
+    epoch: number,
+    log: Logger,
+  ): Promise<ProcessResult> {
+    const issueConfig = this.config.github;
+    if (!issueConfig || !this.#github) {
+      return await this.prepareAndDeliver(
+        job,
+        owner,
+        this.userResponse(message, epoch, USER_MESSAGES.issueNotConfigured, "failed"),
+        log,
+      );
+    }
+    if (!issueConfig.allowedUserIds.has(String(message.from!.id))) {
+      return await this.prepareAndDeliver(
+        job,
+        owner,
+        this.userResponse(message, epoch, USER_MESSAGES.issueNotAllowed, "failed"),
+        log,
+      );
+    }
+    if (messageText.length > this.config.maxMessageChars) {
+      return await this.prepareAndDeliver(
+        job,
+        owner,
+        this.userResponse(message, epoch, USER_MESSAGES.tooLong, "failed"),
+        log,
+      );
+    }
+
+    const argumentsText = messageText.trimStart().replace(/^\S+/, "");
+    const parsed = parseIssueArguments(argumentsText);
+    const repository = parsed && issueConfig.repositories.get(parsed.alias);
+    if (!parsed || !repository) {
+      return await this.prepareAndDeliver(
+        job,
+        owner,
+        this.userResponse(message, epoch, this.issueUsage()),
+        log,
+      );
+    }
+
+    const rateAllowed = await this.store.takeRateLimit(
+      job.updateId,
+      message.chat.id,
+      message.from!.id,
+      this.#now(),
+      this.config.rateLimitPerMinute,
+    );
+    if (!rateAllowed) {
+      return await this.prepareAndDeliver(
+        job,
+        owner,
+        this.userResponse(message, epoch, USER_MESSAGES.rateLimited),
+        log,
+      );
+    }
+
+    const recent = await this.store.getRecentMessages(
+      message.chat.id,
+      message.message_thread_id,
+      epoch,
+      job.updateId - 1,
+      this.config.maxContextMessages,
+      message.direct_messages_topic?.topic_id,
+    );
+    const context = buildIssueContext(
+      recent,
+      this.config.maxContextMessages,
+      this.config.maxContextChars,
+    );
+    if (!parsed.description && context.length === 0) {
+      return await this.prepareAndDeliver(
+        job,
+        owner,
+        this.userResponse(message, epoch, USER_MESSAGES.issueContextInsufficient),
+        log,
+      );
+    }
+
+    if (
+      !message.chat.is_direct_messages &&
+      message.direct_messages_topic?.topic_id === undefined
+    ) {
+      try {
+        await this.telegram.sendChatAction(message.chat.id, message.message_thread_id);
+      } catch {
+        log.warn({ action: "typing_failed" });
+      }
+    }
+
+    const request = parsed.description
+      ? `Configured repository: ${repository}\n\nIssue request:\n${parsed.description}`
+      : `Configured repository: ${repository}\n\nCreate an issue from the preceding conversation.`;
+    const generationMessages: ConversationMessage[] = [
+      ...context,
+      { role: "user", content: request },
+    ];
+
+    await this.refreshLeases(
+      job.updateId,
+      owner,
+      message.chat.id,
+      message.message_thread_id,
+      message.direct_messages_topic?.topic_id,
+      this.config.aiTimeoutMs + 15_000,
+    );
+
+    let aiResponse;
+    try {
+      const options: AIGenerationOptions = { webSearch: false };
+      aiResponse = await this.ai.generate(
+        ISSUE_SYSTEM_PROMPT,
+        generationMessages,
+        options,
+      );
+    } catch (error) {
+      log.error({ action: "issue_ai_failed", ...safeErrorDetails(error) });
+      if (error instanceof AIProviderError && error.retryable) throw error;
+      return await this.prepareAndDeliver(
+        job,
+        owner,
+        this.userResponse(message, epoch, USER_MESSAGES.aiError, "failed"),
+        log,
+      );
+    }
+
+    let draft;
+    try {
+      draft = parseIssueDraft(aiResponse.text);
+    } catch (error) {
+      if (!(error instanceof IssueDraftError)) throw error;
+      log.warn({ action: "issue_draft_rejected", reason: error.code });
+      return await this.prepareAndDeliver(
+        job,
+        owner,
+        this.userResponse(message, epoch, USER_MESSAGES.issueDraftInvalid, "failed"),
+        log,
+      );
+    }
+    if (!draft.relevant) {
+      return await this.prepareAndDeliver(
+        job,
+        owner,
+        this.userResponse(message, epoch, USER_MESSAGES.issueContextInsufficient),
+        log,
+      );
+    }
+    if (containsLikelySecret(`${draft.title}\n${draft.body}`)) {
+      return await this.prepareAndDeliver(
+        job,
+        owner,
+        this.userResponse(message, epoch, USER_MESSAGES.issueDraftInvalid, "failed"),
+        log,
+      );
+    }
+
+    const checkpointed = await this.store.saveIssueSubmission(
+      job.updateId,
+      owner,
+      {
+        alias: parsed.alias,
+        repository,
+        title: draft.title,
+        body: draft.body,
+        marker: this.#randomUUID(),
+        inputTokens: aiResponse.inputTokens,
+        outputTokens: aiResponse.outputTokens,
+      },
+      this.#now(),
+    );
+    return await this.publishIssue(checkpointed, owner, message, log);
+  }
+
+  private async publishIssue(
+    job: UpdateJob,
+    owner: string,
+    message: TelegramMessage,
+    log: Logger,
+  ): Promise<ProcessResult> {
+    const checkpoint = job.issueSubmission;
+    if (!checkpoint) throw new Error("Issue submission checkpoint is missing");
+    const epoch = await this.store.getConversationEpoch(
+      message.chat.id,
+      message.message_thread_id,
+      message.direct_messages_topic?.topic_id,
+    );
+    const issueConfig = this.config.github;
+    if (
+      !issueConfig ||
+      !this.#github ||
+      !issueConfig.allowedUserIds.has(String(message.from!.id)) ||
+      issueConfig.repositories.get(checkpoint.alias) !== checkpoint.repository
+    ) {
+      return await this.prepareAndDeliver(
+        job,
+        owner,
+        {
+          ...this.userResponse(
+            message,
+            epoch,
+            USER_MESSAGES.issueCreateFailed,
+            "failed",
+          ),
+          inputTokens: checkpoint.inputTokens,
+          outputTokens: checkpoint.outputTokens,
+        },
+        log,
+      );
+    }
+
+    await this.refreshLeases(
+      job.updateId,
+      owner,
+      message.chat.id,
+      message.message_thread_id,
+      message.direct_messages_topic?.topic_id,
+      75_000,
+    );
+
+    let issue: GitHubIssue;
+    try {
+      issue = await this.#github.findIssueByMarker(
+        checkpoint.repository,
+        checkpoint.marker,
+      ) ?? await this.#github.createIssue({
+        repository: checkpoint.repository,
+        title: checkpoint.title,
+        body: checkpoint.body,
+        marker: checkpoint.marker,
+      });
+    } catch (error) {
+      if (error instanceof GitHubApiError && error.retryable) throw error;
+      log.error({ action: "github_issue_failed", ...safeErrorDetails(error) });
+      return await this.prepareAndDeliver(
+        job,
+        owner,
+        {
+          ...this.userResponse(
+            message,
+            epoch,
+            USER_MESSAGES.issueCreateFailed,
+            "failed",
+          ),
+          inputTokens: checkpoint.inputTokens,
+          outputTokens: checkpoint.outputTokens,
+        },
+        log,
+      );
+    }
+
+    return await this.prepareAndDeliver(
+      job,
+      owner,
+      {
+        ...this.userResponse(
+          message,
+          epoch,
+          `Created ${checkpoint.repository} issue #${issue.number}: ${issue.url}`,
+        ),
+        inputTokens: checkpoint.inputTokens,
+        outputTokens: checkpoint.outputTokens,
+      },
+      log,
     );
   }
 
@@ -863,10 +1185,19 @@ export class BotApplication {
     if (!renewed) throw new Error("Conversation lease was lost");
   }
 
+  private issueUsage(): string {
+    const aliases = [...(this.config.github?.repositories.keys() ?? [])].toSorted();
+    return `Usage: /issue <${aliases.join("|")}> [description]`;
+  }
+
   private helpText(): string {
+    const issueCommand = this.config.github
+      ? "\n/issue <repo> [description] - Create a GitHub issue"
+      : "";
     return `Hi! I'm ${this.config.botName}, an AI assistant. ` +
       `Mention me with @${this.config.botUsername} in a group, or message me privately.\n\n` +
-      "Commands:\n/help - Show this message\n/reset - Clear this conversation";
+      "Commands:\n/help - Show this message\n/reset - Clear this conversation" +
+      issueCommand;
   }
 }
 
@@ -903,6 +1234,10 @@ function safeErrorDetails(
   } else if (error instanceof TelegramApiError) {
     details.status = error.status;
     if (error.errorCode !== undefined) details.errorCode = error.errorCode;
+    if (error.retryAfterMs !== undefined) details.retryAfterMs = error.retryAfterMs;
+  } else if (error instanceof GitHubApiError) {
+    details.retryable = error.retryable;
+    if (error.status !== undefined) details.status = error.status;
     if (error.retryAfterMs !== undefined) details.retryAfterMs = error.retryAfterMs;
   }
   return details;

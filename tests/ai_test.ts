@@ -24,6 +24,32 @@ Deno.test("OpenAI chat completions request and usage are mapped", async () => {
   assert.equal((requestBody?.messages as unknown[]).length, 2);
 });
 
+Deno.test("per-call options can disable configured web search", async () => {
+  let requestedUrl = "";
+  let requestBody: Record<string, unknown> | undefined;
+  const fetcher = ((input: RequestInfo | URL, init?: RequestInit) => {
+    requestedUrl = String(input);
+    requestBody = JSON.parse(String(init?.body));
+    return Promise.resolve(
+      Response.json({
+        choices: [{ message: { content: "draft" }, finish_reason: "stop" }],
+      }),
+    );
+  }) as typeof fetch;
+  const client = new ProviderAIClient(testConfig({ webSearch: true }), fetcher);
+
+  const result = await client.generate(
+    "system",
+    [{ role: "user", content: "write an issue" }],
+    { webSearch: false },
+  );
+
+  assert.equal(result.text, "draft");
+  assert.equal(requestedUrl, "https://api.openai.com/v1/chat/completions");
+  assert.equal(requestBody?.tools, undefined);
+  assert.equal(requestBody?.store, undefined);
+});
+
 Deno.test("OpenAI does not double-count reasoning token details", async () => {
   const fetcher = (() =>
     Promise.resolve(Response.json({

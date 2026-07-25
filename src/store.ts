@@ -1,6 +1,7 @@
 import { conversationKey } from "./helpers.ts";
 import type {
   ImageReference,
+  IssueSubmissionCheckpoint,
   JobResponse,
   StoredMessage,
   StoredUpdateJob,
@@ -176,6 +177,7 @@ export class BotStore {
         ...job,
         update: compactUpdateForDelivery(job.update),
         state: "response_ready",
+        issueSubmission: undefined,
         response: readyResponse,
         updatedAt: now,
         leaseUntil: Math.max(job.leaseUntil ?? 0, now + 45_000),
@@ -206,6 +208,46 @@ export class BotStore {
       if (result.ok) return readyResponse;
     }
     throw new Error("Could not save job response after concurrent writes");
+  }
+
+  async saveIssueSubmission(
+    updateId: number,
+    owner: string,
+    checkpoint: IssueSubmissionCheckpoint,
+    now: number,
+  ): Promise<UpdateJob> {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const entry = await this.kv.get<StoredUpdateJob>(["job", updateId]);
+      const job = entry.value;
+      if (!job) throw new Error("Update job no longer exists");
+      if (isTerminalJob(job)) throw new Error("Update job is already terminal");
+      if (job.leaseOwner !== owner) throw new Error("Update job lease was lost");
+      if (job.state !== "pending") {
+        throw new Error("Only pending jobs can save an issue submission");
+      }
+      if (job.issueSubmission) {
+        if (issueSubmissionsEqual(job.issueSubmission, checkpoint)) return job;
+        throw new Error("Update job already has an issue submission");
+      }
+
+      const updated: UpdateJob = {
+        ...job,
+        update: compactUpdateForDelivery(job.update),
+        issueSubmission: checkpoint,
+        updatedAt: now,
+      };
+      const expireIn = activeJobExpireIn(updated, now);
+      const result = await this.kv.atomic().check(entry)
+        .set(["job", updateId], updated, { expireIn })
+        .set(
+          ["conversation_pending", jobConversationKey(updated), updateId],
+          true,
+          { expireIn },
+        )
+        .commit();
+      if (result.ok) return updated;
+    }
+    throw new Error("Could not save issue submission after concurrent writes");
   }
 
   async readJobAssistantHistory(
@@ -619,6 +661,7 @@ export class BotStore {
         ...job,
         update: compactUpdateForDelivery(job.update),
         state: "response_ready",
+        issueSubmission: undefined,
         response: readyResponse,
         updatedAt: now,
         leaseUntil: Math.max(job.leaseUntil ?? 0, now + 45_000),
@@ -960,7 +1003,11 @@ function legacyMessageReasoningKey(
 ): Deno.KvKey {
   return [
     "message_reasoning",
-    conversationKey(message.chatId, message.messageThreadId),
+    conversationKey(
+      message.chatId,
+      message.messageThreadId,
+      message.directMessagesTopicId,
+    ),
     message.epoch,
     message.updateId,
     message.order,
@@ -1037,4 +1084,17 @@ function terminalJob(
     attempts,
     ...(errorCode !== undefined && { errorCode }),
   };
+}
+
+function issueSubmissionsEqual(
+  left: IssueSubmissionCheckpoint,
+  right: IssueSubmissionCheckpoint,
+): boolean {
+  return left.alias === right.alias &&
+    left.repository === right.repository &&
+    left.title === right.title &&
+    left.body === right.body &&
+    left.marker === right.marker &&
+    left.inputTokens === right.inputTokens &&
+    left.outputTokens === right.outputTokens;
 }

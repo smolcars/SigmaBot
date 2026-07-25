@@ -134,6 +134,16 @@ export interface JobResponse {
   imagePrompt?: ImagePromptReference;
 }
 
+export interface IssueSubmissionCheckpoint {
+  alias: string;
+  repository: string;
+  title: string;
+  body: string;
+  marker: string;
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
 export type ActiveJobState = "pending" | "response_ready";
 export type TerminalJobState = "done" | "ignored" | "failed";
 export type JobState = ActiveJobState | TerminalJobState;
@@ -152,6 +162,7 @@ export interface UpdateJob extends UpdateJobMetadata {
   leaseOwner?: string;
   leaseUntil?: number;
   retryNotBefore?: number;
+  issueSubmission?: IssueSubmissionCheckpoint;
   response?: JobResponse;
 }
 
@@ -161,6 +172,7 @@ export interface TerminalUpdateJob extends UpdateJobMetadata {
   leaseOwner?: never;
   leaseUntil?: never;
   retryNotBefore?: never;
+  issueSubmission?: never;
   response?: never;
 }
 

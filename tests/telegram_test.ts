@@ -10,18 +10,33 @@ Deno.test("sendMessage emits topic and reply parameters", async () => {
   const client = new TelegramClient("token", fetcher, "https://example.test/bot");
   const sent = await client.sendMessage(1, "hello", {
     messageThreadId: 42,
-    directMessagesTopicId: 43,
     replyToMessageId: 7,
     parseMode: "HTML",
   });
   assert.equal(body?.message_thread_id, 42);
-  assert.equal(body?.direct_messages_topic_id, 43);
   assert.deepEqual(body?.reply_parameters, {
     message_id: 7,
     allow_sending_without_reply: true,
   });
   assert.equal(body?.parse_mode, "HTML");
   assert.equal(sent.message_id, 9);
+});
+
+Deno.test("sendMessage routes direct messages without a forum topic parameter", async () => {
+  let body: Record<string, unknown> | undefined;
+  const fetcher = ((_input: RequestInfo | URL, init?: RequestInit) => {
+    body = JSON.parse(String(init?.body));
+    return Promise.resolve(Response.json({ ok: true, result: { message_id: 9 } }));
+  }) as typeof fetch;
+  const client = new TelegramClient("token", fetcher, "https://example.test/bot");
+
+  await client.sendMessage(1, "hello", {
+    directMessagesTopicId: 43,
+    messageThreadId: 42,
+  });
+
+  assert.equal(body?.direct_messages_topic_id, 43);
+  assert.equal(body?.message_thread_id, undefined);
 });
 
 Deno.test("webhook setup requests ordered Telegram delivery", async () => {
@@ -34,6 +49,37 @@ Deno.test("webhook setup requests ordered Telegram delivery", async () => {
 
   assert.equal(await client.setWebhook("https://bot.example/webhook", "secret"), true);
   assert.equal(body?.max_connections, 1);
+});
+
+Deno.test("setMyCommands registers help and reset by default", async () => {
+  let body: Record<string, unknown> | undefined;
+  const fetcher = ((_input: RequestInfo | URL, init?: RequestInit) => {
+    body = JSON.parse(String(init?.body));
+    return Promise.resolve(Response.json({ ok: true, result: true }));
+  }) as typeof fetch;
+  const client = new TelegramClient("token", fetcher, "https://example.test/bot");
+
+  assert.equal(await client.setMyCommands(), true);
+  assert.deepEqual(body?.commands, [
+    { command: "help", description: "Show help" },
+    { command: "reset", description: "Clear this conversation" },
+  ]);
+});
+
+Deno.test("setMyCommands includes issue when GitHub publishing is enabled", async () => {
+  let body: Record<string, unknown> | undefined;
+  const fetcher = ((_input: RequestInfo | URL, init?: RequestInit) => {
+    body = JSON.parse(String(init?.body));
+    return Promise.resolve(Response.json({ ok: true, result: true }));
+  }) as typeof fetch;
+  const client = new TelegramClient("token", fetcher, "https://example.test/bot");
+
+  assert.equal(await client.setMyCommands(true), true);
+  assert.deepEqual(body?.commands, [
+    { command: "help", description: "Show help" },
+    { command: "reset", description: "Clear this conversation" },
+    { command: "issue", description: "Create a GitHub issue" },
+  ]);
 });
 
 Deno.test("HTTP 200 Telegram envelopes with ok:false are failures", async () => {

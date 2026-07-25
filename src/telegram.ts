@@ -71,11 +71,10 @@ export class TelegramClient implements TelegramGateway {
       chat_id: chatId,
       text,
     };
-    if (options.messageThreadId !== undefined) {
-      body.message_thread_id = options.messageThreadId;
-    }
     if (options.directMessagesTopicId !== undefined) {
       body.direct_messages_topic_id = options.directMessagesTopicId;
+    } else if (options.messageThreadId !== undefined) {
+      body.message_thread_id = options.messageThreadId;
     }
     if (options.replyToMessageId !== undefined) {
       body.reply_parameters = {
@@ -185,12 +184,16 @@ export class TelegramClient implements TelegramGateway {
     return await this.call("getWebhookInfo", {});
   }
 
-  async setMyCommands(): Promise<boolean> {
+  async setMyCommands(includeIssue = false): Promise<boolean> {
+    const commands = [
+      { command: "help", description: "Show help" },
+      { command: "reset", description: "Clear this conversation" },
+    ];
+    if (includeIssue) {
+      commands.push({ command: "issue", description: "Create a GitHub issue" });
+    }
     return await this.call("setMyCommands", {
-      commands: [
-        { command: "help", description: "Show help" },
-        { command: "reset", description: "Clear this conversation" },
-      ],
+      commands,
     });
   }
 

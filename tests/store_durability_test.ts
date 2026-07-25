@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { BotStore } from "../src/store.ts";
-import type { StoredMessage } from "../src/types.ts";
+import type { IssueSubmissionCheckpoint, StoredMessage } from "../src/types.ts";
 import { makeUpdate } from "./test_utils.ts";
 
 const JOB_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -281,24 +281,205 @@ Deno.test("legacy reasoning layouts remain readable and migrate on completion", 
     assert.equal(migrated?.text, "legacy delivery text");
     assert.equal(migrated?.reasoningContent, "legacy reasoning");
 
+    const directChatId = -100;
+    const directTopicId = 33;
+    const directConversationKey = `${directChatId}:direct:${directTopicId}`;
     const legacyMessage = {
       ...stored(81, 1, "assistant", "old completed answer"),
+      chatId: directChatId,
+      directMessagesTopicId: directTopicId,
       reasoningChunkCount: 1,
     };
-    await kv.set(["message", "1:main", 0, 81, 1], legacyMessage);
+    await kv.set(["message", directConversationKey, 0, 81, 1], legacyMessage);
     await kv.set(
-      ["message_reasoning", "1:main", 0, 81, 1, 0],
+      ["message_reasoning", directConversationKey, 0, 81, 1, 0],
       "old completed reasoning",
     );
-    const oldCompleted = (await store.getRecentMessages(1, undefined, 0, 81, 10))
-      .find((message) => message.updateId === 81);
+    const oldCompleted = (await store.getRecentMessages(
+      directChatId,
+      undefined,
+      0,
+      81,
+      10,
+      directTopicId,
+    )).find((message) => message.updateId === 81);
     assert.equal(oldCompleted?.reasoningContent, "old completed reasoning");
 
-    await store.resetConversation(1);
+    await store.resetConversation(directChatId, undefined, directTopicId);
     assert.equal(
-      (await kv.get(["message_reasoning", "1:main", 0, 81, 1, 0])).value,
+      (await kv.get([
+        "message_reasoning",
+        directConversationKey,
+        0,
+        81,
+        1,
+        0,
+      ])).value,
       null,
     );
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("issue checkpoints require the current job lease owner", async () => {
+  const kv = await Deno.openKv(":memory:");
+  try {
+    const store = new BotStore(kv);
+    await store.acceptUpdate(makeUpdate(90), 1000);
+    assert.equal((await store.claimJob(90, "old", 1000, 10)).result, "claimed");
+    assert.equal((await store.claimJob(90, "new", 1011, 5000)).result, "claimed");
+
+    await assert.rejects(
+      () => store.saveIssueSubmission(90, "old", issueCheckpoint(), 1012),
+      /lease was lost/,
+    );
+    assert.equal((await store.getJob(90))?.state, "pending");
+
+    const saved = await store.saveIssueSubmission(
+      90,
+      "new",
+      issueCheckpoint(),
+      1013,
+    );
+    assert.deepEqual(saved.issueSubmission, issueCheckpoint());
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("issue checkpoints survive retries with a processable compact update", async () => {
+  const kv = await Deno.openKv(":memory:");
+  try {
+    const store = new BotStore(kv);
+    await store.acceptUpdate(
+      makeUpdate(91, {
+        text: "/issue blixt sensitive report details",
+        message_thread_id: 42,
+      }),
+      1000,
+    );
+    await store.claimJob(91, "first", 1001, 5000);
+    const checkpoint = issueCheckpoint({
+      title: "Payment fails after scanning an invoice",
+      inputTokens: 120,
+      outputTokens: 45,
+    });
+    const saved = await store.saveIssueSubmission(91, "first", checkpoint, 1002);
+
+    assert.equal(saved.state, "pending");
+    assert.deepEqual(saved.issueSubmission, checkpoint);
+    assert.deepEqual(saved.update, {
+      update_id: 91,
+      message: {
+        message_id: 91,
+        message_thread_id: 42,
+        from: { id: 1, first_name: "" },
+        chat: { id: 1, type: "private" },
+      },
+    });
+    assert.equal(JSON.stringify(saved).includes("sensitive report details"), false);
+
+    await store.releaseJob(91, "first", 1003);
+    const retry = await store.claimJob(91, "retry", 1004, 5000);
+    assert.equal(retry.result, "claimed");
+    if (retry.result !== "claimed") assert.fail();
+    assert.deepEqual(retry.job.issueSubmission, checkpoint);
+    assert.equal(retry.job.update.message?.chat.id, 1);
+    assert.equal(retry.job.update.message?.from?.id, 1);
+    assert.equal(retry.job.update.message?.message_thread_id, 42);
+
+    const repeated = await store.saveIssueSubmission(
+      91,
+      "retry",
+      checkpoint,
+      1005,
+    );
+    assert.deepEqual(repeated.issueSubmission, checkpoint);
+    await assert.rejects(
+      () =>
+        store.saveIssueSubmission(
+          91,
+          "retry",
+          issueCheckpoint({ marker: "different" }),
+          1006,
+        ),
+      /already has an issue submission/,
+    );
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("issue checkpoint writes preserve the active job deadline", async () => {
+  const kv = await Deno.openKv(":memory:");
+  try {
+    const recordedSets: RecordedSet[] = [];
+    const store = new BotStore(recordingKv(kv, recordedSets));
+    await store.acceptUpdate(makeUpdate(92), 1000);
+    await store.claimJob(92, "owner", 1000 + JOB_TTL_MS - 5000, 4000);
+    recordedSets.length = 0;
+
+    await store.saveIssueSubmission(
+      92,
+      "owner",
+      issueCheckpoint(),
+      1000 + JOB_TTL_MS - 4000,
+    );
+
+    assert.deepEqual(
+      recordedSets.map(({ key, expireIn }) => ({ key, expireIn })),
+      [
+        { key: ["job", 92], expireIn: 4000 },
+        {
+          key: ["conversation_pending", "1:main", 92],
+          expireIn: 4000,
+        },
+      ],
+    );
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("response and terminal transitions discard issue checkpoint content", async () => {
+  const kv = await Deno.openKv(":memory:");
+  try {
+    const store = new BotStore(kv);
+    const checkpoint = issueCheckpoint({ body: "private generated issue body" });
+    await store.acceptUpdate(makeUpdate(93), 1000);
+    await store.claimJob(93, "owner", 1001, 5000);
+    await store.saveIssueSubmission(93, "owner", checkpoint, 1002);
+    await store.saveJobResponse(93, "owner", {
+      chatId: 1,
+      messageId: 93,
+      epoch: 0,
+      text: "Created smolcars/blixt-wallet issue #123: https://example.com/123",
+      storeAssistant: false,
+    }, 1003);
+
+    const ready = await store.getJob(93);
+    assert.equal(ready?.state, "response_ready");
+    if (ready?.state !== "response_ready") assert.fail();
+    assert.equal(ready.issueSubmission, undefined);
+    assert.equal(JSON.stringify(ready).includes(checkpoint.body), false);
+
+    await store.completeDeliveredJob(93, "owner", 1004, "done");
+    const completed = await store.getJob(93);
+    assert.deepEqual(completed, {
+      updateId: 93,
+      state: "done",
+      createdAt: 1000,
+      updatedAt: 1004,
+      attempts: 0,
+    });
+    assert.equal(JSON.stringify(completed).includes(checkpoint.marker), false);
+
+    await store.acceptUpdate(makeUpdate(94), 2000);
+    await store.claimJob(94, "owner", 2001, 5000);
+    await store.saveIssueSubmission(94, "owner", checkpoint, 2002);
+    await store.finishJob(94, "owner", "failed", 2003, "github_rejected");
+    assert.equal(JSON.stringify(await store.getJob(94)).includes(checkpoint.body), false);
   } finally {
     kv.close();
   }
@@ -359,5 +540,18 @@ function stored(
     role,
     text,
     createdAt: updateId,
+  };
+}
+
+function issueCheckpoint(
+  overrides: Partial<IssueSubmissionCheckpoint> = {},
+): IssueSubmissionCheckpoint {
+  return {
+    alias: "blixt",
+    repository: "smolcars/blixt-wallet",
+    title: "Invoice payment fails",
+    body: "## Description\n\nPayment fails after scanning an invoice.",
+    marker: "00000000-0000-4000-8000-000000000090",
+    ...overrides,
   };
 }

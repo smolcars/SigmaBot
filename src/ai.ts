@@ -81,8 +81,13 @@ export interface AIGateway {
   generate(
     systemPrompt: string,
     messages: ConversationMessage[],
+    options?: AIGenerationOptions,
   ): Promise<AIResponse>;
   supportsImages(): Promise<boolean>;
+}
+
+export interface AIGenerationOptions {
+  webSearch?: boolean;
 }
 
 export class AIProviderError extends Error {
@@ -169,13 +174,14 @@ export class ProviderAIClient implements AIGateway {
   async generate(
     systemPrompt: string,
     messages: ConversationMessage[],
+    options: AIGenerationOptions = {},
   ): Promise<AIResponse> {
     const deadline = this.retryTiming.now() + this.config.aiTimeoutMs;
     const hasImage = messages.some((message) =>
       Array.isArray(message.content) &&
       message.content.some((part) => part.type === "image")
     );
-    const search = this.config.webSearch && !hasImage;
+    const search = (options.webSearch ?? this.config.webSearch) && !hasImage;
     switch (this.config.aiProvider) {
       case "claude":
         return await this.callClaude(systemPrompt, messages, deadline);

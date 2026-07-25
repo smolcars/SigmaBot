@@ -14,6 +14,25 @@ function env(overrides: Record<string, string | undefined> = {}) {
   };
 }
 
+const TEST_GITHUB_PRIVATE_KEY = [
+  "-----BEGIN PRIVATE KEY-----",
+  "dGVzdA==",
+  "-----END PRIVATE KEY-----",
+  "",
+].join("\n");
+
+function githubEnv(overrides: Record<string, string | undefined> = {}) {
+  return {
+    GITHUB_APP_ID: "12345",
+    GITHUB_APP_INSTALLATION_ID: "67890",
+    GITHUB_APP_PRIVATE_KEY_BASE64: btoa(TEST_GITHUB_PRIVATE_KEY),
+    GITHUB_REPOSITORIES_JSON:
+      '{"sigmabot":"smolcars/SigmaBot","Blixt":"smolcars/blixt-wallet"}',
+    ALLOWED_ISSUE_USER_IDS: "1, 42",
+    ...overrides,
+  };
+}
+
 Deno.test("loadConfig parses required values and secure defaults", () => {
   const config = loadConfig(env());
   assert.equal(config.botUsername, "sigmabot");
@@ -22,6 +41,96 @@ Deno.test("loadConfig parses required values and secure defaults", () => {
   assert.deepEqual([...config.allowedUserIds], ["1", "2"]);
   assert.equal(config.webSearch, false);
   assert.equal(config.maxOutputTokens, 131_072);
+  assert.equal(config.github, undefined);
+});
+
+Deno.test("loadConfig parses GitHub App issue publishing configuration", () => {
+  const config = loadConfig(env(githubEnv()));
+
+  assert.deepEqual(config.github, {
+    appId: "12345",
+    installationId: "67890",
+    privateKey: TEST_GITHUB_PRIVATE_KEY,
+    repositories: new Map([
+      ["sigmabot", "smolcars/SigmaBot"],
+      ["blixt", "smolcars/blixt-wallet"],
+    ]),
+    allowedUserIds: new Set(["1", "42"]),
+  });
+});
+
+Deno.test("loadConfig requires all GitHub issue publishing variables together", () => {
+  const configured = githubEnv();
+  for (const name of Object.keys(configured)) {
+    assert.throws(
+      () => loadConfig(env({ ...configured, [name]: undefined })),
+      new RegExp(name),
+    );
+  }
+  assert.throws(
+    () => loadConfig(env({ ALLOWED_ISSUE_USER_IDS: "1" })),
+    /configured together/,
+  );
+});
+
+Deno.test("loadConfig validates GitHub App IDs and private key", () => {
+  assert.throws(
+    () => loadConfig(env(githubEnv({ GITHUB_APP_ID: "0" }))),
+    /GITHUB_APP_ID must be a positive numeric ID/,
+  );
+  assert.throws(
+    () => loadConfig(env(githubEnv({ GITHUB_APP_INSTALLATION_ID: "1.5" }))),
+    /GITHUB_APP_INSTALLATION_ID must be a positive numeric ID/,
+  );
+  assert.throws(
+    () =>
+      loadConfig(
+        env(githubEnv({ GITHUB_APP_PRIVATE_KEY_BASE64: "not base64" })),
+      ),
+    /must be valid base64/,
+  );
+  assert.throws(
+    () =>
+      loadConfig(
+        env(githubEnv({ GITHUB_APP_PRIVATE_KEY_BASE64: btoa("not a PEM") })),
+      ),
+    /must decode to a PEM private key/,
+  );
+});
+
+Deno.test("loadConfig validates GitHub repository aliases and destinations", () => {
+  for (
+    const repositories of [
+      "not-json",
+      "[]",
+      "{}",
+      '{"has space":"smolcars/SigmaBot"}',
+      '{"one":"smolcars/SigmaBot","ONE":"smolcars/blixt-wallet"}',
+      '{"blixt":"not-a-repository"}',
+      '{"blixt":"-invalid/blixt-wallet"}',
+      '{"blixt":"smolcars/blixt wallet"}',
+    ]
+  ) {
+    assert.throws(
+      () =>
+        loadConfig(
+          env(githubEnv({ GITHUB_REPOSITORIES_JSON: repositories })),
+        ),
+      /GITHUB_REPOSITORIES_JSON/,
+    );
+  }
+});
+
+Deno.test("loadConfig requires valid GitHub issue publisher user IDs", () => {
+  for (const allowedUserIds of ["", "alice", "-100", "0"]) {
+    assert.throws(
+      () =>
+        loadConfig(
+          env(githubEnv({ ALLOWED_ISSUE_USER_IDS: allowedUserIds })),
+        ),
+      /ALLOWED_ISSUE_USER_IDS/,
+    );
+  }
 });
 
 Deno.test("loadConfig fails closed without the webhook secret", () => {

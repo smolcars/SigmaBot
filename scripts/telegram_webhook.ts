@@ -7,6 +7,16 @@ function required(name: string): string {
   return value;
 }
 
+function githubIssuePublishingConfigured(): boolean {
+  return [
+    "GITHUB_APP_ID",
+    "GITHUB_APP_INSTALLATION_ID",
+    "GITHUB_APP_PRIVATE_KEY_BASE64",
+    "GITHUB_REPOSITORIES_JSON",
+    "ALLOWED_ISSUE_USER_IDS",
+  ].every((name) => Boolean(Deno.env.get(name)?.trim()));
+}
+
 async function main(): Promise<void> {
   const action = Deno.args[0] ?? "set";
   const dropPending = Deno.args.includes("--drop-pending");
@@ -20,7 +30,7 @@ async function main(): Promise<void> {
       required("TELEGRAM_WEBHOOK_SECRET"),
       dropPending,
     );
-    await client.setMyCommands();
+    await client.setMyCommands(githubIssuePublishingConfigured());
     console.log(JSON.stringify({ ok: true, action, webhookUrl, commandsUpdated: true }));
     return;
   }

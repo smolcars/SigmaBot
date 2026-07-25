@@ -1,6 +1,7 @@
 import { ProviderAIClient } from "./src/ai.ts";
 import { BotApplication } from "./src/bot.ts";
 import { type AppConfig, loadConfig } from "./src/config.ts";
+import { GitHubClient } from "./src/github.ts";
 import { Logger } from "./src/logger.ts";
 import { BotStore } from "./src/store.ts";
 import { TelegramClient } from "./src/telegram.ts";
@@ -32,6 +33,9 @@ async function createRuntime(): Promise<Runtime> {
     store,
     new TelegramClient(config.telegramToken),
     new ProviderAIClient(config),
+    {
+      ...(config.github && { github: new GitHubClient(config.github) }),
+    },
   );
 
   return { app, config };

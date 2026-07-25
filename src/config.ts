@@ -1,5 +1,13 @@
 import type { AIProvider, ImageSupportMode } from "./types.ts";
 
+export interface GitHubConfig {
+  appId: string;
+  installationId: string;
+  privateKey: string;
+  repositories: ReadonlyMap<string, string>;
+  allowedUserIds: ReadonlySet<string>;
+}
+
 export interface AppConfig {
   botName: string;
   botUsername: string;
@@ -27,6 +35,7 @@ export interface AppConfig {
   systemPrompt: string;
   port: number;
   kvPath?: string;
+  github?: GitHubConfig;
 }
 
 const DEFAULT_SYSTEM_PROMPT = `You are SigmaBot, an AI assistant in a Telegram chat.
@@ -81,6 +90,131 @@ function readIdSet(
     throw new Error(`${name} must contain comma-separated Telegram numeric IDs`);
   }
   return new Set(values);
+}
+
+function decodeGitHubPrivateKey(value: string): string {
+  if (
+    value.length % 4 !== 0 ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)
+  ) {
+    throw new Error("GITHUB_APP_PRIVATE_KEY_BASE64 must be valid base64");
+  }
+
+  let decoded: string;
+  try {
+    const bytes = Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
+    decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error("GITHUB_APP_PRIVATE_KEY_BASE64 must be valid base64-encoded UTF-8");
+  }
+
+  if (
+    !/^-----BEGIN (?:RSA )?PRIVATE KEY-----\r?\n[\s\S]+\r?\n-----END (?:RSA )?PRIVATE KEY-----\r?\n?$/
+      .test(decoded)
+  ) {
+    throw new Error("GITHUB_APP_PRIVATE_KEY_BASE64 must decode to a PEM private key");
+  }
+  return decoded;
+}
+
+function readGitHubRepositories(value: string): ReadonlyMap<string, string> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("GITHUB_REPOSITORIES_JSON must be valid JSON");
+  }
+  if (
+    !parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
+    Object.getPrototypeOf(parsed) !== Object.prototype
+  ) {
+    throw new Error("GITHUB_REPOSITORIES_JSON must be a JSON object");
+  }
+
+  const repositories = new Map<string, string>();
+  for (const [alias, repository] of Object.entries(parsed)) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(alias)) {
+      throw new Error(
+        "GITHUB_REPOSITORIES_JSON aliases must contain only letters, numbers, _ and -",
+      );
+    }
+    const normalizedAlias = alias.toLowerCase();
+    if (repositories.has(normalizedAlias)) {
+      throw new Error("GITHUB_REPOSITORIES_JSON aliases must be unique case-insensitively");
+    }
+    if (
+      typeof repository !== "string" ||
+      !/^(?!-)(?!.*--)[A-Za-z0-9-]{1,39}(?<!-)\/(?!\.{1,2}$)[A-Za-z0-9._-]{1,100}$/
+        .test(repository)
+    ) {
+      throw new Error(
+        "GITHUB_REPOSITORIES_JSON values must be valid owner/repository names",
+      );
+    }
+    repositories.set(normalizedAlias, repository);
+  }
+  if (repositories.size === 0) {
+    throw new Error("GITHUB_REPOSITORIES_JSON must configure at least one repository");
+  }
+  return repositories;
+}
+
+function readGitHubConfig(
+  env: Record<string, string | undefined>,
+): GitHubConfig | undefined {
+  const variableNames = [
+    "GITHUB_APP_ID",
+    "GITHUB_APP_INSTALLATION_ID",
+    "GITHUB_APP_PRIVATE_KEY_BASE64",
+    "GITHUB_REPOSITORIES_JSON",
+    "ALLOWED_ISSUE_USER_IDS",
+  ] as const;
+  const values = new Map(
+    variableNames.map((name) => [name, env[name]?.trim() || undefined]),
+  );
+  if (variableNames.every((name) => values.get(name) === undefined)) {
+    return undefined;
+  }
+
+  const missing = variableNames.filter((name) => values.get(name) === undefined);
+  if (missing.length > 0) {
+    throw new Error(
+      `GitHub issue publishing variables must be configured together; missing: ${
+        missing.join(", ")
+      }`,
+    );
+  }
+
+  const appId = values.get("GITHUB_APP_ID")!;
+  const installationId = values.get("GITHUB_APP_INSTALLATION_ID")!;
+  if (!/^[1-9]\d*$/.test(appId)) {
+    throw new Error("GITHUB_APP_ID must be a positive numeric ID");
+  }
+  if (!/^[1-9]\d*$/.test(installationId)) {
+    throw new Error("GITHUB_APP_INSTALLATION_ID must be a positive numeric ID");
+  }
+
+  const allowedUserIds = new Set(
+    values.get("ALLOWED_ISSUE_USER_IDS")!.split(",").map((value) => value.trim()).filter(
+      Boolean,
+    ),
+  );
+  if (
+    allowedUserIds.size === 0 ||
+    [...allowedUserIds].some((value) => !/^[1-9]\d*$/.test(value))
+  ) {
+    throw new Error(
+      "ALLOWED_ISSUE_USER_IDS must contain comma-separated Telegram user numeric IDs",
+    );
+  }
+
+  return {
+    appId,
+    installationId,
+    privateKey: decodeGitHubPrivateKey(values.get("GITHUB_APP_PRIVATE_KEY_BASE64")!),
+    repositories: readGitHubRepositories(values.get("GITHUB_REPOSITORIES_JSON")!),
+    allowedUserIds,
+  };
 }
 
 function readProvider(value: string | undefined): AIProvider {
@@ -222,5 +356,6 @@ export function loadConfig(
     systemPrompt,
     port: readInteger(env, "PORT", 8000, 1, 65_535),
     kvPath: env.KV_PATH?.trim() || undefined,
+    github: readGitHubConfig(env),
   };
 }

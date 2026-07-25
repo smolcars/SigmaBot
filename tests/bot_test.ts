@@ -1,17 +1,45 @@
 import assert from "node:assert/strict";
 import { AIProviderError } from "../src/ai.ts";
 import { BotApplication } from "../src/bot.ts";
+import type { AppConfig, GitHubConfig } from "../src/config.ts";
+import { GitHubApiError } from "../src/github.ts";
 import { BotStore } from "../src/store.ts";
 import { TelegramApiError } from "../src/telegram.ts";
 import {
   FakeAI,
+  FakeGitHub,
   FakeTelegram,
   makeUpdate,
   testConfig,
   webhookRequest,
 } from "./test_utils.ts";
 
-async function fixture(overrides = {}) {
+function githubConfig(overrides: Partial<GitHubConfig> = {}): GitHubConfig {
+  return {
+    appId: "1",
+    installationId: "2",
+    privateKey: "test-private-key",
+    repositories: new Map([
+      ["sigmabot", "smolcars/SigmaBot"],
+      ["blixt", "smolcars/blixt-wallet"],
+    ]),
+    allowedUserIds: new Set(["1"]),
+    ...overrides,
+  };
+}
+
+function issueDraft(
+  title = "Fix the reported problem",
+  body =
+    "## Description\nProblem details.\n\n## Context\nObserved in chat.\n\n## Expected Behavior\nIt works.",
+): string {
+  return JSON.stringify({ title, body, relevant: true });
+}
+
+async function fixture(
+  overrides: Partial<AppConfig> = {},
+  github = new FakeGitHub(),
+) {
   const kv = await Deno.openKv(":memory:");
   const store = new BotStore(kv);
   const telegram = new FakeTelegram();
@@ -23,13 +51,14 @@ async function fixture(overrides = {}) {
     store,
     telegram,
     ai,
-    { now: () => now++, randomUUID: () => `owner-${++id}` },
+    { now: () => now++, randomUUID: () => `owner-${++id}`, github },
   );
   return {
     kv,
     store,
     telegram,
     ai,
+    github,
     app,
     advanceTime: (milliseconds: number) => {
       now += milliseconds;
@@ -191,6 +220,47 @@ Deno.test("Telegram delivery retry resumes response without a second AI call", a
   }
 });
 
+Deno.test("ordinary Markdown links stay clickable across delivery retry", async () => {
+  const { kv, app, store, telegram, ai } = await fixture();
+  try {
+    ai.response = {
+      text: "Read [the docs](https://example.com/path).",
+    };
+    telegram.failMessages = 1;
+    const update = makeUpdate(106);
+
+    assert.equal((await app.fetch(webhookRequest(update))).status, 500);
+    assert.equal(ai.calls.length, 1);
+    assert.equal(telegram.messageAttempts, 1);
+
+    const checkpoint = await store.getJob(106);
+    assert.equal(checkpoint?.state, "response_ready");
+    if (checkpoint?.state !== "response_ready" || !checkpoint.response) {
+      assert.fail("response checkpoint was not saved");
+    }
+    const formatted = checkpoint.response.formatted;
+    assert.ok(formatted);
+    assert.equal(formatted.parseMode, "HTML");
+    assert.equal(
+      formatted.text,
+      'Read <a href="https://example.com/path">the docs</a>.',
+    );
+    assert.equal(
+      checkpoint.response.text,
+      "Read the docs (https://example.com/path).",
+    );
+
+    assert.equal((await app.fetch(webhookRequest(update))).status, 200);
+    assert.equal(ai.calls.length, 1);
+    assert.equal(telegram.messageAttempts, 2);
+    assert.equal(telegram.messages.length, 1);
+    assert.deepEqual(telegram.messages[0]?.formatted, formatted);
+    assert.equal(telegram.messages[0]?.plainText, checkpoint.response.text);
+  } finally {
+    kv.close();
+  }
+});
+
 Deno.test("oversized web metadata is checkpointed once and remains clickable", async () => {
   const { kv, app, store, telegram, ai } = await fixture();
   try {
@@ -310,19 +380,596 @@ Deno.test("help excludes issue creation and reset clears only its topic", async 
   }
 });
 
-Deno.test("legacy issue command has no issue or AI behavior", async () => {
-  const { kv, app, store, telegram, ai } = await fixture();
+Deno.test("disabled issue command returns a configuration error without history", async () => {
+  const { kv, app, store, telegram, ai, github } = await fixture();
   try {
     assert.equal(
       (await app.fetch(webhookRequest(makeUpdate(30, { text: "/issue make one" })))).status,
       200,
     );
     assert.equal(ai.calls.length, 0);
-    assert.equal(telegram.messages.length, 0);
-    assert.deepEqual(
-      (await store.getRecentMessages(1, undefined, 0, 30, 10)).map((item) => item.text),
-      ["/issue make one"],
+    assert.equal(github.findCalls.length, 0);
+    assert.equal(github.createCalls.length, 0);
+    assert.match(telegram.messages[0]?.plainText ?? "", /isn't configured/);
+    assert.deepEqual(await store.getRecentMessages(1, undefined, 0, 30, 10), []);
+    assert.equal((await store.getJob(30))?.state, "failed");
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("help advertises issue creation only when GitHub is enabled", async () => {
+  const { kv, app, telegram, ai, github } = await fixture({ github: githubConfig() });
+  try {
+    assert.equal(
+      (await app.fetch(webhookRequest(makeUpdate(31, { text: "/help" })))).status,
+      200,
     );
+    assert.match(
+      telegram.messages[0]?.plainText ?? "",
+      /\/issue <repo> \[description\] - Create a GitHub issue/,
+    );
+    assert.equal(ai.calls.length, 0);
+    assert.equal(github.findCalls.length, 0);
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("GitHub configuration requires an injected gateway", async () => {
+  const kv = await Deno.openKv(":memory:");
+  try {
+    assert.throws(
+      () =>
+        new BotApplication(
+          testConfig({ github: githubConfig() }),
+          new BotStore(kv),
+          new FakeTelegram(),
+          new FakeAI(),
+        ),
+      /no GitHub gateway/i,
+    );
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("issue authorization is separate and fail-closed", async () => {
+  const { kv, app, store, telegram, ai, github } = await fixture({
+    allowedUserIds: new Set(["1", "2"]),
+    github: githubConfig({ allowedUserIds: new Set(["1"]) }),
+  });
+  try {
+    const update = makeUpdate(32, {
+      from: { id: 2, first_name: "Denied User" },
+      text: "/issue blixt create this",
+    });
+    assert.equal((await app.fetch(webhookRequest(update))).status, 200);
+    assert.match(telegram.messages[0]?.plainText ?? "", /aren't allowed/);
+    assert.equal(ai.calls.length, 0);
+    assert.equal(github.findCalls.length, 0);
+    assert.equal(github.createCalls.length, 0);
+    assert.deepEqual(await store.getRecentMessages(1, undefined, 0, 32, 10), []);
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("issue aliases are required, sorted, and restricted to configuration", async () => {
+  const { kv, app, store, telegram, ai, github } = await fixture({
+    github: githubConfig(),
+  });
+  try {
+    assert.equal(
+      (await app.fetch(webhookRequest(makeUpdate(33, { text: "/issue" })))).status,
+      200,
+    );
+    assert.equal(
+      (await app.fetch(webhookRequest(makeUpdate(34, {
+        text: "/issue smolcars/other arbitrary repo",
+      })))).status,
+      200,
+    );
+    for (const sent of telegram.messages) {
+      assert.equal(sent.plainText, "Usage: /issue <blixt|sigmabot> [description]");
+    }
+    assert.equal(ai.calls.length, 0);
+    assert.equal(github.findCalls.length, 0);
+    assert.equal(github.createCalls.length, 0);
+    assert.deepEqual(await store.getRecentMessages(1, undefined, 0, 34, 10), []);
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("overlong issue commands are rejected before AI generation", async () => {
+  const { kv, app, store, telegram, ai, github } = await fixture({
+    github: githubConfig(),
+    maxMessageChars: 24,
+  });
+  try {
+    const update = makeUpdate(35, { text: `/issue blixt ${"x".repeat(30)}` });
+    assert.equal((await app.fetch(webhookRequest(update))).status, 200);
+    assert.match(telegram.messages[0]?.plainText ?? "", /too long/i);
+    assert.equal(ai.calls.length, 0);
+    assert.equal(github.findCalls.length, 0);
+    assert.deepEqual(await store.getRecentMessages(1, undefined, 0, 35, 10), []);
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("alias-only issue creation requires prior topic context", async () => {
+  const { kv, app, store, telegram, ai, github } = await fixture({
+    github: githubConfig(),
+  });
+  try {
+    const update = makeUpdate(36, { text: "/issue blixt" });
+    assert.equal((await app.fetch(webhookRequest(update))).status, 200);
+    assert.match(telegram.messages[0]?.plainText ?? "", /enough context/i);
+    assert.equal(ai.calls.length, 0);
+    assert.equal(github.findCalls.length, 0);
+    assert.deepEqual(await store.getRecentMessages(1, undefined, 0, 36, 10), []);
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("issue command routes a configured alias without web search or history", async () => {
+  const github = new FakeGitHub();
+  github.createdIssue = {
+    number: 77,
+    url: "https://github.com/smolcars/blixt-wallet/issues/77",
+  };
+  const { kv, app, store, telegram, ai } = await fixture(
+    { github: githubConfig(), webSearch: true },
+    github,
+  );
+  try {
+    ai.response = {
+      text: issueDraft("Wallet fails to start"),
+      inputTokens: 44,
+      outputTokens: 12,
+    };
+    const update = makeUpdate(37, {
+      chat: {
+        id: -100,
+        type: "supergroup",
+        is_direct_messages: true,
+      },
+      direct_messages_topic: { topic_id: 700 },
+      text: "/issue@sigmabot blixt Wallet fails to start",
+    });
+    assert.equal((await app.fetch(webhookRequest(update))).status, 200);
+
+    assert.equal(ai.calls.length, 1);
+    assert.deepEqual(ai.calls[0]?.options, { webSearch: false });
+    assert.match(ai.calls[0]?.systemPrompt ?? "", /GitHub issue drafts/);
+    assert.equal(
+      ai.calls[0]?.messages.every((item) => typeof item.content === "string"),
+      true,
+    );
+    assert.match(
+      String(ai.calls[0]?.messages.at(-1)?.content),
+      /Wallet fails to start/,
+    );
+    assert.deepEqual(github.findCalls, [{
+      repository: "smolcars/blixt-wallet",
+      marker: github.createCalls[0]?.marker,
+    }]);
+    assert.deepEqual(github.createCalls[0], {
+      repository: "smolcars/blixt-wallet",
+      title: "Wallet fails to start",
+      body: JSON.parse(ai.response.text).body,
+      marker: github.findCalls[0]?.marker,
+    });
+    assert.equal(
+      telegram.messages[0]?.plainText,
+      "Created smolcars/blixt-wallet issue #77: " +
+        "https://github.com/smolcars/blixt-wallet/issues/77",
+    );
+    assert.equal(telegram.messages[0]?.options?.directMessagesTopicId, 700);
+    assert.equal(telegram.actions.length, 0);
+    assert.deepEqual(
+      await store.getRecentMessages(-100, undefined, 0, 37, 10, 700),
+      [],
+    );
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("alias-only issue context is topic-scoped and anonymized", async () => {
+  const { kv, app, store, telegram, ai, github } = await fixture({
+    github: githubConfig(),
+  });
+  try {
+    ai.response = {
+      text: "same-topic assistant context",
+      reasoningContent: "hidden provider reasoning",
+    };
+    assert.equal(
+      (await app.fetch(webhookRequest(makeUpdate(38, {
+        message_thread_id: 10,
+        text: "same-topic failure details",
+        reply_to_message: {
+          message_id: 1,
+          chat: { id: 1, type: "private" },
+          from: { id: 8, first_name: "Bob" },
+          text: "original report",
+        },
+      })))).status,
+      200,
+    );
+    ai.response = { text: "cross-topic assistant context" };
+    assert.equal(
+      (await app.fetch(webhookRequest(makeUpdate(39, {
+        message_thread_id: 20,
+        from: { id: 1, first_name: "Charlie" },
+        text: "cross-topic details",
+      })))).status,
+      200,
+    );
+
+    ai.calls.length = 0;
+    ai.response = { text: issueDraft("Same-topic failure") };
+    assert.equal(
+      (await app.fetch(webhookRequest(makeUpdate(40, {
+        message_thread_id: 10,
+        from: { id: 1, first_name: "Alice" },
+        text: "/issue sigmabot",
+      })))).status,
+      200,
+    );
+
+    assert.equal(ai.calls.length, 1);
+    const suppliedContext = JSON.stringify(ai.calls[0]?.messages);
+    assert.match(suppliedContext, /\[User\]:/);
+    assert.match(suppliedContext, /Replying to another message/);
+    assert.match(suppliedContext, /same-topic failure details/);
+    assert.doesNotMatch(suppliedContext, /Alice|Bob|Charlie/);
+    assert.doesNotMatch(suppliedContext, /cross-topic|hidden provider reasoning/);
+    assert.equal(github.createCalls[0]?.repository, "smolcars/SigmaBot");
+    assert.equal(telegram.messages.at(-1)?.options?.messageThreadId, 10);
+    assert.deepEqual(
+      (await store.getRecentMessages(1, 10, 0, 40, 10)).map((item) => item.text),
+      [
+        '[Replying to Bob: "original report"]\nsame-topic failure details',
+        "same-topic assistant context",
+      ],
+    );
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("irrelevant, malformed, and secret-bearing drafts never reach GitHub", async () => {
+  const cases = [
+    {
+      name: "irrelevant",
+      response: JSON.stringify({ title: "", body: "", relevant: false }),
+      expectedMessage: /enough context/i,
+      expectedState: "done",
+    },
+    {
+      name: "malformed",
+      response: "not JSON",
+      expectedMessage: /safe GitHub issue/i,
+      expectedState: "failed",
+    },
+    {
+      name: "secret",
+      response: issueDraft(
+        "Leaked token",
+        "## Description\nghp_abcdefghijklmnopqrstuvwxyz123456\n\n" +
+          "## Context\nFound in logs.\n\n## Expected Behavior\nRedacted.",
+      ),
+      expectedMessage: /safe GitHub issue/i,
+      expectedState: "failed",
+    },
+  ] as const;
+
+  for (const [index, testCase] of cases.entries()) {
+    const { kv, app, store, telegram, ai, github } = await fixture({
+      github: githubConfig(),
+    });
+    try {
+      ai.response = { text: testCase.response };
+      const updateId = 41 + index;
+      assert.equal(
+        (await app.fetch(webhookRequest(makeUpdate(updateId, {
+          text: "/issue blixt enough detail to generate a draft",
+        })))).status,
+        200,
+        testCase.name,
+      );
+      assert.equal(ai.calls.length, 1, testCase.name);
+      assert.equal(github.findCalls.length, 0, testCase.name);
+      assert.equal(github.createCalls.length, 0, testCase.name);
+      assert.match(
+        telegram.messages[0]?.plainText ?? "",
+        testCase.expectedMessage,
+        testCase.name,
+      );
+      assert.equal((await store.getJob(updateId))?.state, testCase.expectedState);
+      assert.deepEqual(
+        await store.getRecentMessages(1, undefined, 0, updateId, 10),
+        [],
+        testCase.name,
+      );
+    } finally {
+      kv.close();
+    }
+  }
+});
+
+Deno.test("a retryable create reconciles its marker without regenerating or reposting", async () => {
+  const github = new FakeGitHub();
+  github.createError = new GitHubApiError("ambiguous failure", 503, true);
+  const { kv, app, store, telegram, ai } = await fixture(
+    { github: githubConfig() },
+    github,
+  );
+  try {
+    ai.response = { text: issueDraft("Recover submission"), inputTokens: 20 };
+    const update = makeUpdate(44, { text: "/issue blixt recover this failure" });
+
+    assert.equal((await app.fetch(webhookRequest(update))).status, 500);
+    assert.equal(ai.calls.length, 1);
+    assert.equal(github.findCalls.length, 1);
+    assert.equal(github.createCalls.length, 1);
+    assert.equal(telegram.messages.length, 0);
+    const checkpointed = await store.getJob(44);
+    assert.equal(checkpointed?.state, "pending");
+    assert.ok(checkpointed?.state === "pending" && checkpointed.issueSubmission);
+    assert.equal(
+      checkpointed?.state === "pending" ? checkpointed.update.message?.text : "present",
+      undefined,
+    );
+
+    github.createError = undefined;
+    github.foundIssue = {
+      number: 88,
+      url: "https://github.com/smolcars/blixt-wallet/issues/88",
+    };
+    assert.equal((await app.fetch(webhookRequest(update))).status, 200);
+    assert.equal(ai.calls.length, 1);
+    assert.equal(github.findCalls.length, 2);
+    assert.equal(github.createCalls.length, 1);
+    assert.equal(github.findCalls[0]?.marker, github.findCalls[1]?.marker);
+    assert.match(telegram.messages[0]?.plainText ?? "", /issue #88/);
+    assert.equal((await store.getJob(44))?.state, "done");
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("GitHub retry-after defers the checkpoint and clamps zero to one second", async () => {
+  const github = new FakeGitHub();
+  github.createError = new GitHubApiError("rate limited", 429, true, 0);
+  const { kv, app, store, telegram, ai, advanceTime } = await fixture(
+    { github: githubConfig() },
+    github,
+  );
+  try {
+    ai.response = { text: issueDraft("Deferred submission") };
+    const update = makeUpdate(45, { text: "/issue sigmabot defer this" });
+
+    const deferred = await app.fetch(webhookRequest(update));
+    assert.equal(deferred.status, 503);
+    assert.equal(deferred.headers.get("retry-after"), "1");
+    const checkpoint = await store.getJob(45);
+    assert.equal(checkpoint?.state, "pending");
+    assert.equal(checkpoint?.attempts, 0);
+    assert.ok((checkpoint?.retryNotBefore ?? 0) > 1_000_000);
+    assert.equal(ai.calls.length, 1);
+    assert.equal(github.createCalls.length, 1);
+
+    assert.equal((await app.fetch(webhookRequest(update))).status, 503);
+    assert.equal(github.findCalls.length, 1);
+    assert.equal(github.createCalls.length, 1);
+
+    github.createError = undefined;
+    github.foundIssue = {
+      number: 89,
+      url: "https://github.com/smolcars/SigmaBot/issues/89",
+    };
+    advanceTime(1_001);
+    assert.equal((await app.fetch(webhookRequest(update))).status, 200);
+    assert.equal(ai.calls.length, 1);
+    assert.equal(github.findCalls.length, 2);
+    assert.equal(github.createCalls.length, 1);
+    assert.equal(telegram.messages.length, 1);
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("an existing marker avoids issue creation", async () => {
+  const github = new FakeGitHub();
+  github.foundIssue = {
+    number: 90,
+    url: "https://github.com/smolcars/SigmaBot/issues/90",
+  };
+  const { kv, app, telegram, ai } = await fixture(
+    { github: githubConfig() },
+    github,
+  );
+  try {
+    ai.response = { text: issueDraft("Already submitted") };
+    assert.equal(
+      (await app.fetch(webhookRequest(makeUpdate(46, {
+        text: "/issue sigmabot reconcile this",
+      })))).status,
+      200,
+    );
+    assert.equal(ai.calls.length, 1);
+    assert.equal(github.findCalls.length, 1);
+    assert.equal(github.createCalls.length, 0);
+    assert.match(telegram.messages[0]?.plainText ?? "", /issue #90/);
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("Telegram retry after publication does not repeat GitHub", async () => {
+  const github = new FakeGitHub();
+  const { kv, app, store, telegram, ai } = await fixture(
+    { github: githubConfig() },
+    github,
+  );
+  try {
+    ai.response = { text: issueDraft("Delivery retry") };
+    telegram.failMessages = 1;
+    const update = makeUpdate(47, { text: "/issue sigmabot retry delivery" });
+
+    assert.equal((await app.fetch(webhookRequest(update))).status, 500);
+    const ready = await store.getJob(47);
+    assert.equal(ready?.state, "response_ready");
+    assert.equal(
+      ready?.state === "response_ready" ? ready.issueSubmission : "present",
+      undefined,
+    );
+    assert.equal(ai.calls.length, 1);
+    assert.equal(github.findCalls.length, 1);
+    assert.equal(github.createCalls.length, 1);
+
+    assert.equal((await app.fetch(webhookRequest(update))).status, 200);
+    assert.equal(ai.calls.length, 1);
+    assert.equal(github.findCalls.length, 1);
+    assert.equal(github.createCalls.length, 1);
+    assert.equal(telegram.messageAttempts, 2);
+    assert.equal(telegram.messages.length, 1);
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("permanent GitHub errors produce only a generic failed response", async () => {
+  const github = new FakeGitHub();
+  github.createError = new GitHubApiError(
+    "rejected body ghp_abcdefghijklmnopqrstuvwxyz123456",
+    422,
+    false,
+  );
+  const { kv, app, store, telegram, ai } = await fixture(
+    { github: githubConfig() },
+    github,
+  );
+  try {
+    ai.response = {
+      text: issueDraft("Permanent failure"),
+      inputTokens: 31,
+      outputTokens: 7,
+    };
+    telegram.failMessages = 1;
+    const update = makeUpdate(48, { text: "/issue sigmabot submit this" });
+    assert.equal((await app.fetch(webhookRequest(update))).status, 500);
+    assert.equal(ai.calls.length, 1);
+    assert.equal(github.createCalls.length, 1);
+    const ready = await store.getJob(48);
+    assert.equal(ready?.state, "response_ready");
+    assert.equal(
+      ready?.state === "response_ready" ? ready.response?.inputTokens : undefined,
+      31,
+    );
+    assert.equal(
+      ready?.state === "response_ready" ? ready.response?.outputTokens : undefined,
+      7,
+    );
+    assert.equal(
+      ready?.state === "response_ready" ? ready.response?.text : undefined,
+      "I couldn't create the GitHub issue. Please try again later.",
+    );
+    assert.doesNotMatch(
+      ready?.state === "response_ready" ? ready.response?.text ?? "" : "",
+      /ghp_|body|422/,
+    );
+
+    assert.equal((await app.fetch(webhookRequest(update))).status, 200);
+    assert.equal((await store.getJob(48))?.state, "failed");
+    assert.equal(github.createCalls.length, 1);
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("checkpoint resume revalidates the issue allowlist", async () => {
+  const issueUsers = new Set(["1"]);
+  const github = new FakeGitHub();
+  github.createError = new GitHubApiError("temporary", 503, true);
+  const { kv, app, store, telegram, ai } = await fixture(
+    { github: githubConfig({ allowedUserIds: issueUsers }) },
+    github,
+  );
+  try {
+    ai.response = {
+      text: issueDraft("Permission changed"),
+      inputTokens: 29,
+      outputTokens: 6,
+    };
+    const update = makeUpdate(49, { text: "/issue sigmabot permission test" });
+    assert.equal((await app.fetch(webhookRequest(update))).status, 500);
+    assert.equal(github.findCalls.length, 1);
+    assert.equal(github.createCalls.length, 1);
+
+    issueUsers.clear();
+    github.createError = undefined;
+    telegram.failMessages = 1;
+    assert.equal((await app.fetch(webhookRequest(update))).status, 500);
+    assert.equal(ai.calls.length, 1);
+    assert.equal(github.findCalls.length, 1);
+    assert.equal(github.createCalls.length, 1);
+    const ready = await store.getJob(49);
+    assert.equal(ready?.state, "response_ready");
+    assert.equal(
+      ready?.state === "response_ready" ? ready.response?.inputTokens : undefined,
+      29,
+    );
+    assert.equal(
+      ready?.state === "response_ready" ? ready.response?.outputTokens : undefined,
+      6,
+    );
+    assert.match(
+      ready?.state === "response_ready" ? ready.response?.text ?? "" : "",
+      /couldn't create/,
+    );
+
+    assert.equal((await app.fetch(webhookRequest(update))).status, 200);
+    assert.equal((await store.getJob(49))?.state, "failed");
+    assert.equal(github.findCalls.length, 1);
+    assert.equal(github.createCalls.length, 1);
+  } finally {
+    kv.close();
+  }
+});
+
+Deno.test("checkpoint resume rejects an alias remapped to another repository", async () => {
+  const repositories = new Map([
+    ["sigmabot", "smolcars/SigmaBot"],
+    ["blixt", "smolcars/blixt-wallet"],
+  ]);
+  const github = new FakeGitHub();
+  github.createError = new GitHubApiError("temporary", 503, true);
+  const { kv, app, store, telegram, ai } = await fixture(
+    { github: githubConfig({ repositories }) },
+    github,
+  );
+  try {
+    ai.response = { text: issueDraft("Repository changed") };
+    const update = makeUpdate(491, { text: "/issue sigmabot repository test" });
+    assert.equal((await app.fetch(webhookRequest(update))).status, 500);
+    assert.equal(github.findCalls.length, 1);
+    assert.equal(github.createCalls.length, 1);
+
+    repositories.set("sigmabot", "smolcars/blixt-wallet");
+    github.createError = undefined;
+    assert.equal((await app.fetch(webhookRequest(update))).status, 200);
+    assert.equal(ai.calls.length, 1);
+    assert.equal(github.findCalls.length, 1);
+    assert.equal(github.createCalls.length, 1);
+    assert.equal((await store.getJob(491))?.state, "failed");
+    assert.match(telegram.messages[0]?.plainText ?? "", /couldn't create/);
   } finally {
     kv.close();
   }

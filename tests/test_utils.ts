@@ -1,5 +1,6 @@
-import type { AIGateway } from "../src/ai.ts";
+import type { AIGateway, AIGenerationOptions } from "../src/ai.ts";
 import type { AppConfig } from "../src/config.ts";
+import type { GitHubCreateIssueInput, GitHubGateway, GitHubIssue } from "../src/github.ts";
 import type { TelegramGateway } from "../src/telegram.ts";
 import type {
   AIResponse,
@@ -59,7 +60,11 @@ export function makeUpdate(
 }
 
 export class FakeAI implements AIGateway {
-  calls: { systemPrompt: string; messages: ConversationMessage[] }[] = [];
+  calls: {
+    systemPrompt: string;
+    messages: ConversationMessage[];
+    options?: AIGenerationOptions;
+  }[] = [];
   response: AIResponse = { text: "AI response", inputTokens: 10, outputTokens: 2 };
   error?: Error;
   imageSupport = true;
@@ -73,10 +78,42 @@ export class FakeAI implements AIGateway {
   generate(
     systemPrompt: string,
     messages: ConversationMessage[],
+    options?: AIGenerationOptions,
   ): Promise<AIResponse> {
-    this.calls.push({ systemPrompt, messages: structuredClone(messages) });
+    this.calls.push({
+      systemPrompt,
+      messages: structuredClone(messages),
+      ...(options && { options: structuredClone(options) }),
+    });
     if (this.error) return Promise.reject(this.error);
     return Promise.resolve(this.response);
+  }
+}
+
+export class FakeGitHub implements GitHubGateway {
+  findCalls: { repository: string; marker: string }[] = [];
+  createCalls: GitHubCreateIssueInput[] = [];
+  foundIssue?: GitHubIssue;
+  createdIssue: GitHubIssue = {
+    number: 123,
+    url: "https://github.com/smolcars/SigmaBot/issues/123",
+  };
+  findError?: Error;
+  createError?: Error;
+
+  findIssueByMarker(
+    repository: string,
+    marker: string,
+  ): Promise<GitHubIssue | undefined> {
+    this.findCalls.push({ repository, marker });
+    if (this.findError) return Promise.reject(this.findError);
+    return Promise.resolve(this.foundIssue);
+  }
+
+  createIssue(input: GitHubCreateIssueInput): Promise<GitHubIssue> {
+    this.createCalls.push(structuredClone(input));
+    if (this.createError) return Promise.reject(this.createError);
+    return Promise.resolve(this.createdIssue);
   }
 }
 
